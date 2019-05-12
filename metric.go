@@ -101,3 +101,14 @@ func promkey(sys, key string) string {
 	k := replacer.Replace(key)
 	return namespace + "_" + sys + "_" + k
 }
+
+func promkeyLat(sys, key string, histfunc string) string {
+	// promkey(systemLatency, m), -> promkey("latency", "read") is an example
+	replacer := strings.NewReplacer("-", "_", ".", "_")
+	k := replacer.Replace(key)
+	// k= "read"
+	// aerospike _ latency _ read _ bucket
+	// aerospike _ latency _ read _ sum
+	// aerospike _ latency _ read _ count
+	return namespace + "_" + sys + "_" + k + "_" + histfunc
+}

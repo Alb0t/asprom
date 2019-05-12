@@ -16,22 +16,46 @@ var (
 )
 
 type latencyCollector struct {
-	latency cmetrics
-	ops     cmetrics
+	latency          cmetrics
+	latencyHistogram cmetrics
+	ops              cmetrics
+	histOps          cmetrics
+	bucketSum        cmetrics
 }
 
 func newLatencyCollector() latencyCollector {
 	lc := latencyCollector{
-		latency: map[string]cmetric{},
-		ops:     map[string]cmetric{},
+		latency:          map[string]cmetric{},
+		latencyHistogram: map[string]cmetric{},
+		ops:              map[string]cmetric{},
+		histOps:          map[string]cmetric{},
+		bucketSum:        map[string]cmetric{},
 	}
 	for _, m := range latencyMetrics {
 		lc.latency[m] = cmetric{
 			typ: prometheus.GaugeValue,
 			desc: prometheus.NewDesc(
 				promkey(systemLatency, m),
+				m+" latency",
+				[]string{"namespace", "threshold"}, // threshold to be printed as le for histogram
+				nil,
+			),
+		}
+		lc.latencyHistogram[m] = cmetric{
+			typ: prometheus.GaugeValue,
+			desc: prometheus.NewDesc(
+				promkeyLat(systemLatencyHist, m, "bucket"),
 				m+" latency histogram",
-				[]string{"namespace", "threshold"},
+				[]string{"namespace", "le"}, // threshold to be printed as le for histogram
+				nil,
+			),
+		}
+		lc.histOps[m] = cmetric{
+			typ: prometheus.GaugeValue,
+			desc: prometheus.NewDesc(
+				promkeyLat(systemLatencyHist, m, "count"),
+				m+" ops per second for histogram",
+				[]string{"namespace"},
 				nil,
 			),
 		}
@@ -40,6 +64,15 @@ func newLatencyCollector() latencyCollector {
 			desc: prometheus.NewDesc(
 				promkey(systemOps, m),
 				m+" ops per second",
+				[]string{"namespace"},
+				nil,
+			),
+		}
+		lc.bucketSum[m] = cmetric{
+			typ: prometheus.GaugeValue,
+			desc: prometheus.NewDesc(
+				promkeyLat(systemLatencyHist, m, "sum"),
+				m+" sum of all buckets",
 				[]string{"namespace"},
 				nil,
 			),
@@ -55,6 +88,15 @@ func (lc latencyCollector) describe(ch chan<- *prometheus.Desc) {
 	for _, s := range lc.ops {
 		ch <- s.desc
 	}
+	for _, s := range lc.histOps {
+		ch <- s.desc
+	}
+	for _, s := range lc.bucketSum {
+		ch <- s.desc
+	}
+	for _, s := range lc.latencyHistogram {
+		ch <- s.desc
+	}
 }
 
 func (lc latencyCollector) collect(conn *as.Connection) ([]prometheus.Metric, error) {
@@ -67,6 +109,8 @@ func (lc latencyCollector) collect(conn *as.Connection) ([]prometheus.Metric, er
 		return nil, err
 	}
 	var metrics []prometheus.Metric
+	re := regexp.MustCompile("[0-9.]+") // regex to pull the percentages from >1ms=12.2% => 12.2
+
 	for key, ms := range lat {
 		if key == "batch-index" {
 			continue // TODO: would be nice to do something with this key
@@ -75,21 +119,55 @@ func (lc latencyCollector) collect(conn *as.Connection) ([]prometheus.Metric, er
 		if err != nil {
 			return nil, fmt.Errorf("weird latency key %q: %s", key, err)
 		}
+		// need to grab ops outside of the latency loop
+		// so that we can use it for estimatedBucketOps later
+		// the latency map could be out of order, so OPS/S needs to be accessed first
+		ops := ms["ops/sec"]
+		var bucketSum float64
+		histOpsMetric := lc.histOps[op]
+		metrics = append(
+			metrics,
+			prometheus.MustNewConstMetric(histOpsMetric.desc, histOpsMetric.typ, ops, ns),
+		)
+
+		opsMetric := lc.ops[op]
+		metrics = append(
+			metrics,
+			prometheus.MustNewConstMetric(opsMetric.desc, opsMetric.typ, ops, ns),
+		)
+
 		for threshold, data := range ms {
 			if threshold == "ops/sec" {
-				m := lc.ops[op]
-				metrics = append(
-					metrics,
-					prometheus.MustNewConstMetric(m.desc, m.typ, data, ns),
-				)
 				continue
 			}
-			m := lc.latency[op]
+			thresholdNum := re.FindString(threshold) // filter out >1ms to just the number 1, similarly >8ms becomes 8..
+			bucketVal, _ := strconv.ParseFloat(thresholdNum, 64)
+			bucketSum += bucketVal
+			m := lc.latencyHistogram[op]
+			// latency is exported as % in certain buckets
+			// for histogram consumption, it would be nice to have the estimated number of
+			// operations in each bucket instead. So going to
+			estimatedBucketOps := ops - (ops * data / 100.0)
+			metrics = append(
+				metrics,
+				prometheus.MustNewConstMetric(m.desc, m.typ, estimatedBucketOps, ns, thresholdNum),
+			)
+			m = lc.latency[op]
 			metrics = append(
 				metrics,
 				prometheus.MustNewConstMetric(m.desc, m.typ, data, ns, threshold),
 			)
 		}
+		m := lc.bucketSum[op]
+		metrics = append(
+			metrics,
+			prometheus.MustNewConstMetric(m.desc, m.typ, bucketSum, ns),
+		)
+		m = lc.latencyHistogram[op]
+		metrics = append(
+			metrics,
+			prometheus.MustNewConstMetric(m.desc, m.typ, ops, ns, "+Inf"),
+		)
 	}
 	return metrics, nil
 }
@@ -108,8 +186,8 @@ func parseLatency(lat string) (map[string]map[string]float64, error) {
 		}
 		vs := strings.Split(line, ",")
 		key := strings.SplitN(vs[0], ":", 2)[0] // strips timestamp
-		cols := vs[1:]
 
+		cols := vs[1:]
 		if i+1 >= len(lines) {
 			return nil, fmt.Errorf("latency: missing measurements line")
 		}

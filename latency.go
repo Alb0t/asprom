@@ -44,16 +44,18 @@ func newLatencyCollector() latencyCollector {
 		lc.latencyHistogram[m] = cmetric{
 			typ: prometheus.GaugeValue,
 			desc: prometheus.NewDesc(
-				promkeyLat(systemLatencyHist, m, "bucket"),
+				// for prom histogram latency buckets, metric must end in _bucket
+				promkey(systemLatencyHist, m+"_bucket"),
 				m+" latency histogram",
-				[]string{"namespace", "le"}, // threshold to be printed as le for histogram
+				[]string{"namespace", "le"}, // threshold to be printed as le for histogram, le="1" means ops that completed in less than 1ms
 				nil,
 			),
 		}
 		lc.histOps[m] = cmetric{
 			typ: prometheus.GaugeValue,
 			desc: prometheus.NewDesc(
-				promkeyLat(systemLatencyHist, m, "count"),
+				// for prom histogram, must have a metric ending in _count which is equal to the sum of all observed events
+				promkey(systemLatencyHist, m+"_count"),
 				m+" ops per second for histogram",
 				[]string{"namespace"},
 				nil,
@@ -71,7 +73,8 @@ func newLatencyCollector() latencyCollector {
 		lc.bucketSum[m] = cmetric{
 			typ: prometheus.GaugeValue,
 			desc: prometheus.NewDesc(
-				promkeyLat(systemLatencyHist, m, "sum"),
+				// for prom histogram, must have a metric ending in _sum which is equal to the sum of all observed events values
+				promkey(systemLatencyHist, m+"_sum"),
 				m+" sum of all buckets",
 				[]string{"namespace"},
 				nil,
@@ -142,15 +145,16 @@ func (lc latencyCollector) collect(conn *as.Connection) ([]prometheus.Metric, er
 			}
 			thresholdNum := re.FindString(threshold) // filter out >1ms to just the number 1, similarly >8ms becomes 8..
 			bucketVal, _ := strconv.ParseFloat(thresholdNum, 64)
-			bucketSum += bucketVal
 			m := lc.latencyHistogram[op]
 			// latency is exported as % in certain buckets
 			// for histogram consumption, it would be nice to have the estimated number of
 			// operations in each bucket instead. So going to
-			estimatedBucketOps := ops - (ops * data / 100.0)
+			estimatedBucketOps := ops * data / 100.0
+			bucketSum += (bucketVal * estimatedBucketOps) // to generate sum like aerospike_latency_hist_read_sum
+			leBucketOps := ops - estimatedBucketOps
 			metrics = append(
 				metrics,
-				prometheus.MustNewConstMetric(m.desc, m.typ, estimatedBucketOps, ns, thresholdNum),
+				prometheus.MustNewConstMetric(m.desc, m.typ, leBucketOps, ns, thresholdNum),
 			)
 			m = lc.latency[op]
 			metrics = append(
@@ -186,7 +190,6 @@ func parseLatency(lat string) (map[string]map[string]float64, error) {
 		}
 		vs := strings.Split(line, ",")
 		key := strings.SplitN(vs[0], ":", 2)[0] // strips timestamp
-
 		cols := vs[1:]
 		if i+1 >= len(lines) {
 			return nil, fmt.Errorf("latency: missing measurements line")

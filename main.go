@@ -38,7 +38,7 @@ const (
 var (
 	version     = "master"
 	showVersion = flag.Bool("version", false, "show version")
-	addr        = flag.String("listen", ":9145", "listen address for prometheus")
+	addr        = flag.String("listen", ":9145", "listen address for prometheus. ENV variable EXPORTER_ADDRESS")
 	nodeAddr    = flag.String("node", "127.0.0.1:3000", "aerospike node")
 	username    = flag.String("username", "", "username. Leave empty for no authentication. ENV variable AS_USERNAME, if set, will override this.")
 	password    = flag.String("password", "", "password. ENV variable AS_PASSWORD, if set, will override this.")
@@ -74,6 +74,11 @@ func main() {
 	if pass != "" {
 		*password = pass
 	}
+
+    exporterAddr := os.Getenv("EXPORTER_ADDRESS")
+    if exporterAddr != "" {
+        *addr = exporterAddr
+    }
 
 	if *showVersion {
 		fmt.Printf("asprom %s\n", version)
